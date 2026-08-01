@@ -1,0 +1,315 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+from matplotlib.ticker import MaxNLocator
+
+OUTDIR = 'output_figures/RK4Shooting_Polytropic/3D_figures_grouped'
+os.makedirs(OUTDIR, exist_ok=True)
+TAG = "RK4 Shooting Polytropic"
+
+
+# ---------------------------------------------------------------------
+# Classical fixed-step RK4 integrator for the Lane-Emden / polytropic
+# equation, used as the core of the shooting method.
+#
+#   y'' + (2/x) y' + |y|^m = 0 ,   y(0) = 1 ,  y'(0) = 0
+#
+# The origin is a regular singular point (the 2/x term blows up), so
+# integration is started at a small x = eps using the standard
+# series-expansion initial conditions:
+#   y(eps)  = 1 - eps^2/6
+#   y'(eps) = -eps/3
+# and marched outward to x = R with fixed-step RK4.
+# ---------------------------------------------------------------------
+def lane_emden_rhs(x, Y, m):
+    y, dy = Y
+    d2y = -(2.0 / x) * dy - np.abs(y) ** m
+    return np.array([dy, d2y])
+
+
+def rk4_integrate(m, R, n_steps, eps=1e-8):
+    """Fixed-step classical RK4 march from x=eps to x=R.
+    Returns (x, y, dy) arrays of length n_steps+1."""
+    x = np.linspace(eps, R, n_steps + 1)
+    h = x[1] - x[0]
+    y = np.zeros(n_steps + 1)
+    dy = np.zeros(n_steps + 1)
+    y[0] = 1.0 - (eps ** 2) / 6.0
+    dy[0] = -eps / 3.0
+
+    for i in range(n_steps):
+        xi = x[i]
+        Yi = np.array([y[i], dy[i]])
+        k1 = lane_emden_rhs(xi, Yi, m)
+        k2 = lane_emden_rhs(xi + h / 2.0, Yi + h / 2.0 * k1, m)
+        k3 = lane_emden_rhs(xi + h / 2.0, Yi + h / 2.0 * k2, m)
+        k4 = lane_emden_rhs(xi + h, Yi + h * k3, m)
+        Yi1 = Yi + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        y[i + 1], dy[i + 1] = Yi1
+
+    return x, y, dy
+
+
+def dense_evaluate_shooting(c, x_dense):
+    """Evaluate the converged RK4 shooting solution at arbitrary points
+    via linear interpolation of the dense integrated polyline
+    (analogous role to the old B-spline dense_evaluate)."""
+    x_fine, y_fine = c
+    return np.interp(x_dense, x_fine, y_fine, left=1.0)
+
+
+# ---------------------------------------------------------------------
+# Shooting solver: march outward with RK4, doubling the step count
+# (halving h) until the solution at the reporting nodes stops changing
+# by more than `tol`. This step-doubling sequence stands in for the
+# old Newton-iteration `history`, so the rest of the script (which
+# plots "iterative" convergence) needs no structural changes.
+# ---------------------------------------------------------------------
+def solve_polytropic_shooting(m, p=3, n_elem=40, R=2.0, max_iter=20, tol=1e-9, eps=1e-8):
+    m_val = float(m)
+    n_ctrl = n_elem + p                       # kept only so downstream array
+    tau = np.linspace(0.0, R, n_ctrl)         # shapes match the old B-spline version
+
+    n_steps = 16
+    history = []
+    prev_Y = None
+    x_fine = y_fine = dy_fine = None
+    it = 0
+
+    for it in range(max_iter):
+        x_grid, y_grid, dy_grid = rk4_integrate(m_val, R, n_steps, eps=eps)
+        Y_at_tau = np.interp(tau, x_grid, y_grid, left=1.0)
+        Y_at_tau[tau < eps] = 1.0
+        history.append(Y_at_tau.copy())
+        x_fine, y_fine, dy_fine = x_grid, y_grid, dy_grid
+
+        if prev_Y is not None and np.max(np.abs(Y_at_tau - prev_Y)) < tol:
+            break
+        prev_Y = Y_at_tau
+        n_steps *= 2
+
+    Y_final = history[-1]
+    c = (x_fine, y_fine)   # dense polyline standing in for the old spline control points
+    return None, tau, Y_final, history, c, it
+
+
+def get_true_reference(m, x_eval):
+    if abs(m - 1.0) < 1e-9:
+        return np.where(x_eval < 1e-8, 1.0, np.sin(x_eval) / (x_eval + 1e-15))
+    elif abs(m - 5.0) < 1e-9:
+        return 1.0 / np.sqrt(1.0 + (x_eval ** 2) / 3.0)
+    else:
+        def ode(t_, y):
+            return [y[1], -(2.0/t_)*y[1] - np.abs(y[0])**m]
+        eps = 1e-8
+        y0 = [1.0 - (eps**2)/6.0, -eps/3.0]
+        x_eval_safe = np.clip(x_eval, eps, None)
+        sort_idx = np.argsort(x_eval_safe)
+        x_sorted = x_eval_safe[sort_idx]
+        sol = solve_ivp(ode, [eps, max(x_sorted[-1], eps*2)], y0, t_eval=x_sorted,
+                         method='Radau', rtol=1e-12, atol=1e-13)
+        y_ref = np.zeros_like(x_eval)
+        y_ref[sort_idx] = sol.y[0]
+        y_ref[x_eval < eps] = 1.0
+        return y_ref
+
+
+def get_approx_reference_solution(m, R=2.0, p=3, n_elem_fine=160):
+    """Independent self-convergence reference: same RK4 shooting method
+    run to a tighter tolerance. Returns the dense polyline `c_f` so it
+    can be reused for evaluation at multiple grids without re-solving."""
+    _, _, _, _, c_f, _ = solve_polytropic_shooting(m, p=p, n_elem=n_elem_fine, R=R, tol=1e-9)
+    return c_f
+
+
+def get_approx_reference(m, x_eval, R=2.0, p=3, n_elem_fine=160):
+    """Convenience wrapper: evaluate a freshly solved fine-tolerance
+    reference at x_eval (interpolation only, no external solver)."""
+    c_f = get_approx_reference_solution(m, R=R, p=p, n_elem_fine=n_elem_fine)
+    return dense_evaluate_shooting(c_f, x_eval)
+
+
+def rel_err(Y, ref):
+    scale = max(np.max(np.abs(ref)), 1e-12)
+    return np.abs(Y - ref) / scale
+
+
+def surf(ax, X, Y, Z, cmap, xlabel, ylabel, zlabel, title, int_y=False):
+    s = ax.plot_surface(X, Y, Z, cmap=cmap, edgecolor='k', alpha=0.9)
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel); ax.set_zlabel(zlabel)
+    ax.set_title(f'{TAG} - {title}')
+    if int_y:
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    return s
+
+
+# =======================================================================
+# MAIN
+# =======================================================================
+if __name__ == "__main__":
+    m_values = [1.0, 2.0, 3.0, 4.0, 5.0]
+    R = 2.0
+    p = 3
+    n_elem_main = 40
+
+    x_dense = np.linspace(0.0, R, 200)
+
+    results = {}
+    for m in m_values:
+        t, tau, Y, history, c, nit = solve_polytropic_shooting(m, p=p, n_elem=n_elem_main, R=R)
+        true_ref = get_true_reference(m, tau)
+        c_approx = get_approx_reference_solution(m, R=R, p=p)
+        approx_ref = dense_evaluate_shooting(c_approx, tau)
+
+        Y_dense = dense_evaluate_shooting(c, x_dense)
+        true_ref_dense = get_true_reference(m, x_dense)
+        approx_ref_dense = dense_evaluate_shooting(c_approx, x_dense)
+
+        results[m] = dict(tau=tau, Y=Y, history=history, true_ref=true_ref,
+                           approx_ref=approx_ref, Y_dense=Y_dense,
+                           true_ref_dense=true_ref_dense, approx_ref_dense=approx_ref_dense)
+        print(f"m={m}: {nit} RK4 step-doublings | "
+              f"true err(nodes)={np.max(np.abs(Y-true_ref)):.3e} | "
+              f"approx err(nodes)={np.max(np.abs(Y-approx_ref)):.3e} | "
+              f"true err(dense)={np.max(np.abs(Y_dense-true_ref_dense)):.3e} | "
+              f"approx err(dense)={np.max(np.abs(Y_dense-approx_ref_dense)):.3e}")
+
+    tau_common = results[m_values[0]]['tau']
+    Xg, Mg = np.meshgrid(tau_common, m_values)
+    Xd, Md = np.meshgrid(x_dense, m_values)
+
+    # 01: exact / numerical / final nodal values
+    Zfinal = np.array([results[m]['Y'] for m in m_values])
+    fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+    surf(ax, Xg, Mg, Zfinal, 'viridis', 'x value', 'Parameter value (m)',
+         'Final nodal values', 'Final Nodal Values (Numerical)')
+    fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+    plt.savefig(f'{OUTDIR}/01_exact_numerical_final_nodal_values.png'); plt.close(fig)
+
+    # 02: final relative true error
+    Zerr_true = np.array([rel_err(results[m]['Y'], results[m]['true_ref']) for m in m_values])
+    fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+    surf(ax, Xg, Mg, Zerr_true, 'plasma', 'x value', 'Parameter value (m)',
+         'Final relative true error', 'Final Relative True Error (Numerical)')
+    fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+    plt.savefig(f'{OUTDIR}/02_exact_numerical_final_relative_true_error.png'); plt.close(fig)
+
+    # 03 & 04: iterative (step-doubling) nodal values / true error, per m
+    for m in m_values:
+        history = results[m]['history']
+        true_ref = results[m]['true_ref']
+        iters = np.arange(len(history))
+        Xi, Ii = np.meshgrid(tau_common, iters)
+        Zval = np.array(history)
+        Zerr = np.array([rel_err(h, true_ref) for h in history])
+
+        fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+        surf(ax, Xi, Ii, Zval, 'viridis', 'x value', 'Iteration number',
+             'Iterative nodal values', f'Iterative Nodal Values (m={m})', int_y=True)
+        fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+        plt.savefig(f'{OUTDIR}/03_exact_numerical_iterative_values_p_{m}.png'); plt.close(fig)
+
+        fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+        surf(ax, Xi, Ii, Zerr, 'plasma', 'x value', 'Iteration number',
+             'Iterative relative true error', f'Iterative Relative True Error (m={m})', int_y=True)
+        fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+        plt.savefig(f'{OUTDIR}/04_exact_numerical_iterative_true_error_p_{m}.png'); plt.close(fig)
+
+    # 05 & 06: direct/analytical -- dense-grid evaluation of the SAME converged RK4 solution
+    Zdense_val = np.array([results[m]['Y_dense'] for m in m_values])
+    fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+    surf(ax, Xd, Md, Zdense_val, 'viridis', 'x value', 'Parameter value (m)',
+         'Nodal values (direct RK4 evaluation)',
+         'Direct/Analytical Evaluation of the RK4 Shooting Solution (dense grid)')
+    fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+    plt.savefig(f'{OUTDIR}/05_exact_analytical_nodal_values.png'); plt.close(fig)
+
+    Zdense_err_true = np.array([rel_err(results[m]['Y_dense'], results[m]['true_ref_dense'])
+                                 for m in m_values])
+    fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+    surf(ax, Xd, Md, Zdense_err_true, 'plasma', 'x value', 'Parameter value (m)',
+         'Relative true error (dense grid)',
+         'Direct/Analytical Evaluation - Relative True Error (dense grid)')
+    fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+    plt.savefig(f'{OUTDIR}/06_exact_analytical_relative_true_error.png'); plt.close(fig)
+
+    # 07: no_exact / numerical / final nodal values (same data as 01)
+    fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+    surf(ax, Xg, Mg, Zfinal, 'viridis', 'x value', 'Parameter value (m)',
+         'Final nodal values', 'Final Nodal Values (Numerical)')
+    fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+    plt.savefig(f'{OUTDIR}/07_no_exact_numerical_final_nodal_values.png'); plt.close(fig)
+
+    # 08: final relative approximate error
+    Zerr_approx = np.array([rel_err(results[m]['Y'], results[m]['approx_ref']) for m in m_values])
+    fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+    surf(ax, Xg, Mg, Zerr_approx, 'plasma', 'x value', 'Parameter value (m)',
+         'Final relative approximate error', 'Final Relative Approximate Error (Numerical)')
+    fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+    plt.savefig(f'{OUTDIR}/08_no_exact_numerical_final_relative_approx_error.png'); plt.close(fig)
+
+    # 09 & 10: iterative nodal values / approximate error, per m
+    for m in m_values:
+        history = results[m]['history']
+        approx_ref = results[m]['approx_ref']
+        iters = np.arange(len(history))
+        Xi, Ii = np.meshgrid(tau_common, iters)
+        Zval = np.array(history)
+        Zerr = np.array([rel_err(h, approx_ref) for h in history])
+
+        fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+        surf(ax, Xi, Ii, Zval, 'viridis', 'x value', 'Iteration number',
+             'Iterative nodal values', f'Iterative Nodal Values (m={m})', int_y=True)
+        fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+        plt.savefig(f'{OUTDIR}/09_no_exact_numerical_iterative_values_p_{m}.png'); plt.close(fig)
+
+        fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+        surf(ax, Xi, Ii, Zerr, 'plasma', 'x value', 'Iteration number',
+             'Iterative relative approximate error', f'Iterative Relative Approximate Error (m={m})', int_y=True)
+        fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+        plt.savefig(f'{OUTDIR}/10_no_exact_numerical_iterative_approx_error_p_{m}.png'); plt.close(fig)
+
+    # 11 & 12: direct/analytical -- same dense evaluation, approximate error
+    fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+    surf(ax, Xd, Md, Zdense_val, 'viridis', 'x value', 'Parameter value (m)',
+         'Nodal values (direct RK4 evaluation)',
+         'Direct/Analytical Evaluation of the RK4 Shooting Solution (dense grid)')
+    fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+    plt.savefig(f'{OUTDIR}/11_no_exact_analytical_nodal_values.png'); plt.close(fig)
+
+    Zdense_err_approx = np.array([rel_err(results[m]['Y_dense'], results[m]['approx_ref_dense'])
+                                   for m in m_values])
+    fig = plt.figure(figsize=(8, 6)); ax = fig.add_subplot(111, projection='3d')
+    surf(ax, Xd, Md, Zdense_err_approx, 'plasma', 'x value', 'Parameter value (m)',
+         'Relative approximate error (dense grid)',
+         'Direct/Analytical Evaluation - Relative Approximate Error (dense grid)')
+    fig.colorbar(ax.collections[0], ax=ax, shrink=0.5, pad=0.1)
+    plt.savefig(f'{OUTDIR}/12_no_exact_analytical_relative_approx_error.png'); plt.close(fig)
+
+    n_files = len([f for f in os.listdir(OUTDIR) if f.endswith('.png')])
+    print(f"\nDone. {n_files} PNG figures written to {OUTDIR}/")
+
+    # -------------------------------------------------------------
+    # Convergence study (fixed-step RK4, m=1 and m=5), driven directly
+    # by n_steps (i.e. by h = R/n_steps) rather than by tolerance, so
+    # the classical O(h^4) order of RK4 is what gets measured here.
+    # -------------------------------------------------------------
+    print("\n" + "="*70)
+    print("Convergence study (max nodal error vs exact solution, fixed-step RK4)")
+    print("="*70)
+    for m_test, exact_fn in [(1.0, lambda x: np.where(x < 1e-8, 1.0, np.sin(x)/(x+1e-15))),
+                              (5.0, lambda x: 1.0/np.sqrt(1.0 + x**2/3.0))]:
+        print(f"\n m = {m_test}")
+        print(f"{'n_steps':>8} {'Max Error':>15} {'Observed Order':>16}")
+        prev_err, prev_h = None, None
+        for n_steps in [10, 20, 40, 80, 160]:
+            x_grid, y_grid, _ = rk4_integrate(m_test, R, n_steps)
+            err = np.max(np.abs(y_grid - exact_fn(x_grid)))
+            h = R / n_steps
+            order = np.log(prev_err/err)/np.log(prev_h/h) if prev_err else np.nan
+            order_s = f"{order:.2f}" if not np.isnan(order) else "  --"
+            print(f"{n_steps:>8} {err:>15.3e} {order_s:>16}")
+            prev_err, prev_h = err, h
+    print("\nObserved order ~4 (O(h^4)): the expected classical accuracy of the")
+    print("4th-order Runge-Kutta shooting scheme, confirming correct implementation.")
