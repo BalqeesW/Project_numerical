@@ -273,7 +273,7 @@ if __name__ == '__main__':
     print('=' * 70)
     for m_test, exact_fn in [(1.0, lambda x: np.where(x < 1e-08, 1.0, np.sin(x) / (x + 1e-15))), (5.0, lambda x: 1.0 / np.sqrt(1.0 + x ** 2 / 3.0))]:
         print(f'\n m = {m_test}')
-        print(f'{'n_elem':>8} {'Max Error':>15} {'Observed Order':>16}')
+        print(f"{'n_elem':>8} {'Max Error':>15} {'Observed Order':>16}")
         prev_err, prev_h = (None, None)
         for n_elem in [10, 20, 40, 80, 160]:
             nodes_c, c_c, _, _ = solve_polytropic_fem(m_test, n_elem=n_elem, R=R)
