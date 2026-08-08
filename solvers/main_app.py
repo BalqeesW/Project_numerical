@@ -1,10 +1,12 @@
 import sys
 import os
-import shutil
+import io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -12,7 +14,6 @@ from PyQt5.QtWidgets import (
     QPushButton, QRadioButton, QScrollArea, QFileDialog, QMessageBox, QGridLayout,
     QStackedWidget, QSizePolicy
 )
-from PyQt5.QtGui import QPixmap
 from PyQt5.QtCore import Qt, QTimer
 
 try:
@@ -28,6 +29,7 @@ try:
 except ImportError:
     EXCEL_AVAILABLE = False
 
+# Safely import all solver modules
 try:
     import solvers.finite_difference_Polytropic as fdm_poly
     import solvers.finite_element_Polytropic as fem_poly
@@ -49,21 +51,27 @@ except ImportError:
         SOLVERS_AVAILABLE = False
 
 
+class MplCanvas(FigureCanvas):
+    """In-memory Matplotlib Canvas for dynamic PyQt embedding"""
+    def __init__(self, parent=None, width=8, height=6, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        super().__init__(self.fig)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.updateGeometry()
+
+
 class LaneEmdenGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lane-Emden Numerical Methods Lab (Optimized)")
+        self.setWindowTitle("Lane-Emden Numerical Methods Lab")
         self.setGeometry(50, 50, 1400, 950)
         
-        self.generated_figures = [] 
+        self.plot_queue = [] 
         self.export_tables = {}     
         self.current_fig_index = 0
         
         self.timer = QTimer()
         self.timer.timeout.connect(self.display_next_automated_figure)
-        
-        self.temp_dir = os.path.join(os.getcwd(), "gui_temp_figures")
-        os.makedirs(self.temp_dir, exist_ok=True)
 
         self.init_ui()
 
@@ -111,12 +119,14 @@ class LaneEmdenGUI(QMainWindow):
         
         self.gallery_stack = QStackedWidget()
         self.gallery_stack.setMinimumHeight(600) 
-        self.gallery_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
         self.placeholder = QLabel("Configure parameters and click RUN SOLVERS to generate 3D figures.")
         self.placeholder.setAlignment(Qt.AlignCenter)
         self.placeholder.setStyleSheet("border: 2px dashed #444; color: #888; font-size: 16px; border-radius: 8px;")
         self.gallery_stack.addWidget(self.placeholder)
+        
+        self.canvas = MplCanvas(self, width=8, height=6, dpi=100)
+        self.gallery_stack.addWidget(self.canvas)
         
         gallery_layout.addWidget(self.gallery_stack)
 
@@ -183,15 +193,17 @@ class LaneEmdenGUI(QMainWindow):
         p_layout.addWidget(QLabel(f"{param_label} Sequence:"), 0, 0, 1, 3)
         p_layout.addWidget(QLabel("MIN"), 1, 0)
         p_layout.addWidget(QLabel("MAX"), 1, 1)
-        p_layout.addWidget(QLabel("STEP"), 1, 2)
+        p_layout.addWidget(QLabel("SAMPLES"), 1, 2)
 
         min_sp = QDoubleSpinBox(); min_sp.setValue(1.0)
         max_sp = QDoubleSpinBox(); max_sp.setValue(5.0)
-        step_sp = QDoubleSpinBox(); step_sp.setValue(1.0); step_sp.setMinimum(0.01)
+        
+        # Updated to request Samples instead of Step
+        samples_sp = QSpinBox(); samples_sp.setValue(4); samples_sp.setMinimum(1); samples_sp.setMaximum(1000)
         
         p_layout.addWidget(min_sp, 2, 0)
         p_layout.addWidget(max_sp, 2, 1)
-        p_layout.addWidget(step_sp, 2, 2)
+        p_layout.addWidget(samples_sp, 2, 2)
 
         p_layout.addWidget(QLabel("DOMAIN (XMAX)"), 3, 0)
         p_layout.addWidget(QLabel("TARGET (YTARGET)"), 3, 1)
@@ -231,7 +243,7 @@ class LaneEmdenGUI(QMainWindow):
         
         return {
             'group': group, 'enable': enable_cb, 'methods': cb_dict,
-            'min': min_sp, 'max': max_sp, 'step': step_sp,
+            'min': min_sp, 'max': max_sp, 'samples': samples_sp,
             'xmax': xmax_sp, 'ytarget': ytarget_sp,
             'ea': ea_sp, 'et': et_sp, 'max_iter': max_iter_sp,
             'grid_pts': grid_pts_sp, 'series_terms': series_sp
@@ -299,22 +311,21 @@ class LaneEmdenGUI(QMainWindow):
             return
 
         self.timer.stop()
-        
-        for i in reversed(range(self.gallery_stack.count())): 
-            widget = self.gallery_stack.widget(i)
-            if widget is not self.placeholder:
-                self.gallery_stack.removeWidget(widget)
-                widget.deleteLater()
-
-        self.generated_figures.clear()
+        self.plot_queue.clear()
         self.export_tables.clear()
+        self.gallery_stack.setCurrentWidget(self.placeholder)
 
         if self.p2_panel['enable'].isChecked():
             p_min = self.p2_panel['min'].value()
             p_max = self.p2_panel['max'].value()
-            p_step = self.p2_panel['step'].value()
+            p_samples = self.p2_panel['samples'].value()
             
-            param_vals = np.arange(p_min, p_max + (p_step/2), p_step)
+            # Apply Professor's Exact Modification Formula
+            if p_samples > 0:
+                p_step = (p_max - p_min) / p_samples
+                param_vals = np.arange(p_min, p_max + (p_step/2), p_step)
+            else:
+                param_vals = np.array([p_min])
             
             xmax = self.p2_panel['xmax'].value()
             max_iter = self.p2_panel['max_iter'].value()
@@ -337,16 +348,15 @@ class LaneEmdenGUI(QMainWindow):
                     elif method_name == "B-Spline" and hasattr(bsp_poly, 'solve_polytropic_bspline'):
                         self.run_bspline_solver(param_vals, xmax, max_iter, n_elem)
 
-        if not self.generated_figures:
-            self.gallery_stack.addWidget(self.placeholder)
-            self.gallery_stack.setCurrentWidget(self.placeholder)
+        if not self.plot_queue:
             QMessageBox.information(self, "No Output", "No active methods or problems were selected.")
             return
 
         self.current_fig_index = 0
 
+        # Run Modes Logic
         if self.radio_oneshot.isChecked():
-            self.render_figure_at_index(len(self.generated_figures) - 1)
+            self.render_figure_at_index(len(self.plot_queue) - 1)
         elif self.radio_delay.isChecked():
             self.render_figure_at_index(0)
             delay_ms = int(self.delay_spin.value() * 1000)
@@ -354,85 +364,65 @@ class LaneEmdenGUI(QMainWindow):
         elif self.radio_manual.isChecked():
             self.render_figure_at_index(0)
 
-    def create_and_store_surface_plot(self, X, Y, Z, xlabel, ylabel, zlabel, title, cmap, filename_base, int_y=False):
-        fig = plt.figure(figsize=(7, 5))
-        ax = fig.add_subplot(111, projection='3d')
-        surf = ax.plot_surface(X, Y, Z, cmap=cmap, edgecolor='k', alpha=0.9)
-        
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        ax.set_zlabel(zlabel)
-        ax.set_title(title, pad=10)
-        
-        if int_y:
-            ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-            
-        fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.1)
-
-        # Optimized rendering with lower DPI for lightning-fast preview generation
-        img_path = os.path.join(self.temp_dir, f"{filename_base}.png")
-        plt.savefig(img_path, bbox_inches='tight', dpi=90)
-        plt.close(fig) 
-
-        label = QLabel()
-        label.setAlignment(Qt.AlignCenter)
-        pixmap = QPixmap(img_path)
-        label.setPixmap(pixmap.scaled(900, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        
-        self.gallery_stack.addWidget(label)
-        self.generated_figures.append((title, img_path))
+    # -------------------------------------------------------------------------
+    # In-Memory Plotting Engine 
+    # -------------------------------------------------------------------------
+    def queue_surface_plot(self, X, Y, Z, xlabel, ylabel, zlabel, title, cmap, int_y=False):
+        """Stores plot configuration in memory instead of saving to disk"""
+        self.plot_queue.append({
+            'X': X, 'Y': Y, 'Z': Z,
+            'xlabel': xlabel, 'ylabel': ylabel, 'zlabel': zlabel,
+            'title': title, 'cmap': cmap, 'int_y': int_y
+        })
 
     def _plot_standard_results(self, method_name, module, param_vals, results):
         nodes_common = results[param_vals[0]]['nodes']
         Xg, Mg = np.meshgrid(nodes_common, param_vals)
         
         Zfinal = np.array([results[m]['Y'] for m in param_vals])
-        self.create_and_store_surface_plot(
+        self.queue_surface_plot(
             Xg, Mg, Zfinal, 
             'x value', 'Parameter (m)', 'Final Nodal Values', 
-            f'{method_name} Polytropic - Final Nodal Values', 'viridis', f'{method_name}_final_vals'
+            f'{method_name} Polytropic - Final Nodal Values', 'viridis'
         )
 
         Zerr_hi = np.array([module.rel_err(results[m]['Y'], results[m]['ref_hi']) for m in param_vals])
-        self.create_and_store_surface_plot(
+        self.queue_surface_plot(
             Xg, Mg, Zerr_hi, 
             'x value', 'Parameter (m)', 'Relative True Error', 
-            f'{method_name} Polytropic - Final Relative True Error', 'plasma', f'{method_name}_final_err'
+            f'{method_name} Polytropic - Final Relative True Error', 'plasma'
         )
 
-        # Limit iterative frames to prevent lag (e.g., sample every few iterations if history is large)
+        # Plot EVERY iteration as requested
         for idx, m in enumerate(param_vals):
             history_nodes = results[m].get('history_nodes', [])
             if not history_nodes:
                 continue 
                 
             ref_hi = results[m]['ref_hi']
-            
-            # Subsample history if it has more than 15 steps to guarantee speed
-            if len(history_nodes) > 15:
-                indices = np.linspace(0, len(history_nodes) - 1, 15, dtype=int)
-                history_nodes = [history_nodes[i] for i in indices]
-
             iters = np.arange(len(history_nodes))
             Xi, Ii = np.meshgrid(nodes_common, iters)
             
             Zval = np.array(history_nodes)
             Zerr = np.array([module.rel_err(hh, ref_hi) for hh in history_nodes])
 
-            self.create_and_store_surface_plot(
+            self.queue_surface_plot(
                 Xi, Ii, Zval, 
                 'x value', 'Iteration Number', 'Iterative Nodal Values', 
-                f'{method_name} Polytropic - Iterative Nodal Values (m={m})', 'viridis', f'{method_name}_iter_vals_{idx}', int_y=True
+                f'{method_name} Polytropic - Iterative Nodal Values (m={m})', 'viridis', int_y=True
             )
-            self.create_and_store_surface_plot(
+            self.queue_surface_plot(
                 Xi, Ii, Zerr, 
                 'x value', 'Iteration Number', 'Relative True Error', 
-                f'{method_name} Polytropic - Iterative Relative Error (m={m})', 'plasma', f'{method_name}_iter_err_{idx}', int_y=True
+                f'{method_name} Polytropic - Iterative Relative Error (m={m})', 'plasma', int_y=True
             )
 
         df = pd.DataFrame(Zfinal, index=[f"m={m:.2f}" for m in param_vals], columns=[f"x={x:.2f}" for x in nodes_common])
         self.export_tables[f"{method_name}_Final"] = df
 
+    # -------------------------------------------------------------------------
+    # Solver Interfaces
+    # -------------------------------------------------------------------------
     def run_fdm_solver(self, param_vals, xmax, max_iter, n_elem):
         res = {}
         for m in param_vals:
@@ -483,19 +473,34 @@ class LaneEmdenGUI(QMainWindow):
             res[m] = {'nodes': tau, 'Y': Y_final, 'history_nodes': history_nodes, 'ref_hi': ref_hi}
         self._plot_standard_results("B-Spline", bsp_poly, param_vals, res)
 
+    # -------------------------------------------------------------------------
+    # On-The-Fly Matplotlib Rendering 
+    # -------------------------------------------------------------------------
     def render_figure_at_index(self, index):
-        if 0 <= index < len(self.generated_figures):
-            title, img_path = self.generated_figures[index]
-            widget = self.gallery_stack.widget(index + 1)
+        if 0 <= index < len(self.plot_queue):
+            data = self.plot_queue[index]
             
-            pixmap = QPixmap(img_path)
-            widget.setPixmap(pixmap.scaled(self.gallery_stack.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.canvas.fig.clf()
+            ax = self.canvas.fig.add_subplot(111, projection='3d')
             
-            self.gallery_stack.setCurrentWidget(widget)
-            self.lbl_fig_status.setText(f"Figure {index + 1} / {len(self.generated_figures)}: {title}")
+            surf = ax.plot_surface(data['X'], data['Y'], data['Z'], cmap=data['cmap'], edgecolor='k', alpha=0.9)
+            
+            ax.set_xlabel(data['xlabel'])
+            ax.set_ylabel(data['ylabel'])
+            ax.set_zlabel(data['zlabel'])
+            ax.set_title(data['title'], pad=10)
+            
+            if data['int_y']:
+                ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+                
+            self.canvas.fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.1)
+            self.canvas.draw()
+            
+            self.gallery_stack.setCurrentWidget(self.canvas)
+            self.lbl_fig_status.setText(f"Figure {index + 1} / {len(self.plot_queue)}: {data['title']}")
 
     def display_next_automated_figure(self):
-        if self.current_fig_index < len(self.generated_figures) - 1:
+        if self.current_fig_index < len(self.plot_queue) - 1:
             self.current_fig_index += 1
             self.render_figure_at_index(self.current_fig_index)
         else:
@@ -507,36 +512,64 @@ class LaneEmdenGUI(QMainWindow):
             self.render_figure_at_index(self.current_fig_index)
 
     def show_next_figure(self):
-        if self.current_fig_index < len(self.generated_figures) - 1:
+        if self.current_fig_index < len(self.plot_queue) - 1:
             self.current_fig_index += 1
             self.render_figure_at_index(self.current_fig_index)
 
+    # -------------------------------------------------------------------------
+    # Export Handlers 
+    # -------------------------------------------------------------------------
     def export_figures_to_folder(self):
-        if not self.generated_figures:
+        if not self.plot_queue:
             QMessageBox.warning(self, "Export Error", "No figures available to export.")
             return
         folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if folder:
-            for idx, (title, img_path) in enumerate(self.generated_figures):
-                clean_title = title.replace(" ", "_").replace("-", "_").replace(":", "")
+            for idx, data in enumerate(self.plot_queue):
+                fig = plt.figure(figsize=(9, 7))
+                ax = fig.add_subplot(111, projection='3d')
+                surf = ax.plot_surface(data['X'], data['Y'], data['Z'], cmap=data['cmap'], edgecolor='k', alpha=0.9)
+                ax.set_xlabel(data['xlabel']); ax.set_ylabel(data['ylabel']); ax.set_zlabel(data['zlabel'])
+                ax.set_title(data['title'], pad=10)
+                if data['int_y']: ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+                fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.1)
+                
+                clean_title = data['title'].replace(" ", "_").replace("-", "_").replace(":", "")
                 dest = os.path.join(folder, f"{idx+1:02d}_{clean_title}.png")
-                shutil.copy(img_path, dest)
-            QMessageBox.information(self, "Success", f"Exported {len(self.generated_figures)} images to {folder}")
+                fig.savefig(dest, bbox_inches='tight')
+                plt.close(fig)
+            QMessageBox.information(self, "Success", f"Exported {len(self.plot_queue)} images to {folder}")
 
     def export_to_word(self):
         if not DOCX_AVAILABLE:
             QMessageBox.critical(self, "Error", "python-docx is not installed.")
             return
-        if not self.generated_figures:
+        if not self.plot_queue:
             return
         filepath, _ = QFileDialog.getSaveFileName(self, "Save Word Document", "", "Word Document (*.docx)")
         if filepath:
             doc = docx.Document()
             doc.add_heading("Numerical Methods: 3D Surface Analysis", level=0)
-            for idx, (title, img_path) in enumerate(self.generated_figures):
-                doc.add_heading(f"Figure {idx+1}: {title}", level=2)
-                doc.add_picture(img_path, width=Inches(6.0))
-                doc.add_paragraph(f"Generated solution data for {title}.")
+            
+            for idx, data in enumerate(self.plot_queue):
+                doc.add_heading(f"Figure {idx+1}: {data['title']}", level=2)
+                
+                fig = plt.figure(figsize=(8, 6))
+                ax = fig.add_subplot(111, projection='3d')
+                surf = ax.plot_surface(data['X'], data['Y'], data['Z'], cmap=data['cmap'], edgecolor='k', alpha=0.9)
+                ax.set_xlabel(data['xlabel']); ax.set_ylabel(data['ylabel']); ax.set_zlabel(data['zlabel'])
+                ax.set_title(data['title'], pad=10)
+                if data['int_y']: ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+                fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.1)
+                
+                img_stream = io.BytesIO()
+                fig.savefig(img_stream, format='png', bbox_inches='tight')
+                plt.close(fig)
+                img_stream.seek(0)
+                
+                doc.add_picture(img_stream, width=Inches(6.0))
+                doc.add_paragraph(f"Generated solution data for {data['title']}.")
+                
             doc.save(filepath)
             QMessageBox.information(self, "Success", f"Report saved at {filepath}")
 
