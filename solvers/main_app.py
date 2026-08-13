@@ -534,11 +534,11 @@ class LaneEmdenGUI(QMainWindow):
     def toggle_theme(self):
         if self.is_dark_mode:
             self.setStyleSheet(self.light_theme)
-            self.btn_theme.setText("🌙 Dark Mode")
+            self.btn_theme.setText("Dark Mode")
             self.is_dark_mode = False
         else:
             self.setStyleSheet(self.dark_theme)
-            self.btn_theme.setText("☀️ Light Mode")
+            self.btn_theme.setText("Light Mode")
             self.is_dark_mode = True
             
         # Re-render current figure immediately to apply theme to Matplotlib canvas
