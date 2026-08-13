@@ -142,17 +142,20 @@ def find_first_zero_crossing(x, y):
 # `order_history` (the Pade order used at each snapshot), which drive
 # the script's convergence plots.
 # ---------------------------------------------------------------------
-def solve_polytropic_adm(m, n_nodes=43, R=2.0, max_iter=25, tol=1e-11, N_series=60):
+def solve_polytropic_adm(m, x_min=0.0, x_max=2.0, n_samples=43, max_iter=25, tol=1e-11, N_series=60):
     if m <= 0:
         raise ValueError(f"Polytropic index m must be positive, got m={m}.")
     if N_series < 4:
         raise ValueError(f"N_series must be at least 4 for a meaningful Pade approximant, got {N_series}.")
-    if n_nodes < 2:
-        raise ValueError(f"n_nodes must be at least 2, got {n_nodes}.")
-    if R <= 0:
-        raise ValueError(f"R must be positive, got {R}.")
+    if n_samples < 1:
+        raise ValueError(f"n_samples must be at least 1, got {n_samples}.")
+    if x_max <= x_min:
+        raise ValueError(f"x_max must be greater than x_min, got x_min={x_min}, x_max={x_max}.")
 
-    x_nodes = np.linspace(0.0, R, n_nodes)
+    # Step size is calculated internally from the required specification:
+    # h = (maximum value - minimum value) / number of samples
+    h = (x_max - x_min) / n_samples
+    x_nodes = x_min + h * np.arange(n_samples + 1)
     series_coefficients = adm_series_coeffs(float(m), N_series)
 
     history = []
@@ -217,7 +220,7 @@ def get_approx_reference_solution(m, R=2.0, n_nodes_fine=160, N_series=100):
     if key in _approx_reference_cache:
         return _approx_reference_cache[key]
     _, _, _, _, _, pade_coefficients, _ = solve_polytropic_adm(
-        m, n_nodes=n_nodes_fine, R=R, tol=1e-13, N_series=N_series)
+        m, x_min=0.0, x_max=R, n_samples=n_nodes_fine, tol=1e-13, N_series=N_series)
     _approx_reference_cache[key] = pade_coefficients
     return pade_coefficients
 
@@ -261,17 +264,18 @@ def plot_surface_figure(filename, X, Y, Z, xlabel, ylabel, zlabel, title, cmap, 
 # =======================================================================
 if __name__ == "__main__":
     m_values = [1.0, 2.0, 3.0, 4.0, 5.0]
-    R = 2.0
-    n_nodes_main = 43
+    x_min = 0.0
+    x_max = 2.0
+    n_samples_main = 43
 
-    x_dense = np.linspace(0.0, R, 200)
+    x_dense = np.linspace(x_min, x_max, 200)
 
     results = {}
     for m in m_values:
         _, x_nodes, solution, history, order_history, pade_coefficients, n_iterations = \
-            solve_polytropic_adm(m, n_nodes=n_nodes_main, R=R)
+            solve_polytropic_adm(m, x_min=x_min, x_max=x_max, n_samples=n_samples_main)
         true_ref = get_true_reference(m, x_nodes)
-        approx_pade_coefficients = get_approx_reference_solution(m, R=R)
+        approx_pade_coefficients = get_approx_reference_solution(m, R=x_max)
         approx_ref = dense_evaluate_adm(approx_pade_coefficients, x_nodes)
 
         solution_dense = dense_evaluate_adm(pade_coefficients, x_dense)
@@ -395,7 +399,7 @@ if __name__ == "__main__":
                               (5.0, lambda x: 1.0/np.sqrt(1.0 + x**2/3.0))]:
         print(f"\n m = {m_test}")
         print(f"{'N_series':>9} {'Pade order':>11} {'Max Error':>15}")
-        x_test = np.linspace(0.0, R, 50)
+        x_test = np.linspace(x_min, x_max, 50)
         exact_ref = exact_fn(x_test)   # computed once, reused across all N_series below
 
         n_series_list, err_list = [], []
@@ -413,7 +417,7 @@ if __name__ == "__main__":
     print("\nError collapses super-exponentially with series length: the")
     print("Pade-resummed ADM series reaches machine precision by ~40-60 terms,")
     print("even for m=5 where the raw (non-resummed) Taylor series diverges")
-    print("at x=R=2 because R exceeds its radius of convergence (~sqrt(3)).")
+    print("at x=R=2 because the maximum value x_max exceeds its radius of convergence (~sqrt(3)).")
 
     # Convergence plot: error vs. series length N_series, semilog-y so
     # geometric/spectral convergence appears as a straight line.

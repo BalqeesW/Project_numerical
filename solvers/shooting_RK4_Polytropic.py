@@ -35,16 +35,27 @@ TAG = "RK4 Polytropic (Step-Doubling Self-Convergence)"
 # from the series expansion above, so a single forward march from
 # x=eps to x=R already determines the solution.
 #
+# SAMPLING / STEP SIZE
+# ---------------------
+# The march is parameterized by the NUMBER OF SAMPLES (n_samples) on
+# [x_min, x_max] = [eps, R], never by a manually supplied step size.
+# The step size is always derived internally, exactly, as:
+#
+#       step_size = (x_max - x_min) / n_samples
+#
+# This removes any chance of an inconsistent or mistyped step size
+# being passed in separately from the sampling grid.
+#
 # SELF-CONVERGENCE
 # -----------------
 # To get an accuracy estimate without a closed-form solution, the
-# integration is repeated on a doubling sequence of step counts
-# (n_steps, 2*n_steps, 4*n_steps, ...), i.e. h, h/2, h/4, ..., and the
-# solution at a fixed set of reporting nodes is compared between
-# consecutive refinements. Once the change drops below `tol`, the
-# result is accepted. This refinement sequence is stored in `history`
-# (and the corresponding step sizes in `step_history`) purely for
-# diagnostic/plotting purposes.
+# integration is repeated on a doubling sequence of sample counts
+# (n_samples, 2*n_samples, 4*n_samples, ...), i.e. step sizes
+# h, h/2, h/4, ..., and the solution at a fixed set of reporting nodes
+# is compared between consecutive refinements. Once the change drops
+# below `tol`, the result is accepted. This refinement sequence is
+# stored in `history` (and the corresponding step sizes in
+# `step_history`) purely for diagnostic/plotting purposes.
 # =======================================================================
 def lane_emden_rhs(x, state, m):
     y, dy = state
@@ -52,18 +63,28 @@ def lane_emden_rhs(x, state, m):
     return np.array([dy, d2y])
 
 
-def rk4_integrate(m, R, n_steps, eps=1e-8):
-    """Fixed-step classical RK4 march of the Lane-Emden IVP from x=eps to
-    x=R, using n_steps equal steps of size h=(R-eps)/n_steps.
-    Returns (x, y, dy) arrays of length n_steps+1."""
-    x = np.linspace(eps, R, n_steps + 1)
-    h = x[1] - x[0]
-    y = np.zeros(n_steps + 1)
-    dy = np.zeros(n_steps + 1)
+def rk4_integrate(m, R, n_samples, eps=1e-8):
+    """Fixed-step classical RK4 march of the Lane-Emden IVP from
+    x_min=eps to x_max=R.
+
+    Only the NUMBER OF SAMPLES (n_samples) is taken as input; the step
+    size is never supplied manually. It is instead computed internally,
+    exactly, from:
+
+        step_size = (x_max - x_min) / n_samples = (R - eps) / n_samples
+
+    Returns (x, y, dy) arrays of length n_samples+1."""
+    x_min, x_max = eps, R
+    step_size = (x_max - x_min) / n_samples
+    x = x_min + step_size * np.arange(n_samples + 1)
+    x[-1] = x_max  # guard against floating-point drift on the last node
+    h = step_size
+    y = np.zeros(n_samples + 1)
+    dy = np.zeros(n_samples + 1)
     y[0] = 1.0 - (eps ** 2) / 6.0
     dy[0] = -eps / 3.0
 
-    for i in range(n_steps):
+    for i in range(n_samples):
         xi = x[i]
         state_i = np.array([y[i], dy[i]])
         k1 = lane_emden_rhs(xi, state_i, m)
@@ -108,6 +129,11 @@ def solve_polytropic_rk4(m, n_nodes=43, R=2.0, max_iter=20, tol=1e-9, eps=1e-8):
     integration with step-doubling self-convergence (see module
     docstring above).
 
+    At every refinement, only the NUMBER OF SAMPLES (n_samples) is
+    chosen; the corresponding step size is computed internally by
+    rk4_integrate as (x_max - x_min) / n_samples, never supplied
+    manually.
+
     Returns
     -------
     x_nodes       : fixed reporting grid (n_nodes points on [0, R])
@@ -115,7 +141,8 @@ def solve_polytropic_rk4(m, n_nodes=43, R=2.0, max_iter=20, tol=1e-9, eps=1e-8):
     history       : list of solution-at-x_nodes arrays, one per
                      step-doubling refinement (coarsest to finest)
     step_history  : list of step sizes h used at each refinement,
-                     aligned with `history`
+                     aligned with `history` (each computed internally
+                     as (R - eps) / n_samples)
     dense_solution: (x_fine, y_fine) polyline from the final, converged
                      RK4 march -- used for cubic-spline evaluation
                      elsewhere (e.g. dense_evaluate_rk4)
@@ -124,15 +151,15 @@ def solve_polytropic_rk4(m, n_nodes=43, R=2.0, max_iter=20, tol=1e-9, eps=1e-8):
     m_val = float(m)
     x_nodes = np.linspace(0.0, R, n_nodes)
 
-    n_steps = 16
+    n_samples = 16
     history = []
     step_history = []
     prev_solution = None
     x_fine = y_fine = None
 
     for _ in range(max_iter):
-        x_grid, y_grid, dy_grid = rk4_integrate(m_val, R, n_steps, eps=eps)
-        h = x_grid[1] - x_grid[0]
+        x_grid, y_grid, dy_grid = rk4_integrate(m_val, R, n_samples, eps=eps)
+        h = (R - eps) / n_samples
         solution_at_nodes = np.interp(x_nodes, x_grid, y_grid, left=1.0)
         solution_at_nodes[x_nodes < eps] = 1.0
 
@@ -143,7 +170,7 @@ def solve_polytropic_rk4(m, n_nodes=43, R=2.0, max_iter=20, tol=1e-9, eps=1e-8):
         if prev_solution is not None and np.max(np.abs(solution_at_nodes - prev_solution)) < tol:
             break
         prev_solution = solution_at_nodes
-        n_steps *= 2
+        n_samples *= 2
 
     solution = history[-1]
     dense_solution = (x_fine, y_fine)
@@ -369,30 +396,39 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------
     # Convergence study (fixed-step RK4, m=1 and m=5), driven directly
-    # by n_steps (i.e. by step size h = R/n_steps) rather than by a
-    # convergence tolerance, so the classical O(h^4) order of RK4 is
-    # what gets measured here. A log-log plot of error vs. h makes the
-    # 4th-order slope visually obvious alongside the printed table.
+    # by n_samples (NUMBER OF SAMPLES) rather than by a convergence
+    # tolerance, so the classical O(h^4) order of RK4 is what gets
+    # measured here. The step size is never supplied manually: it is
+    # computed internally, exactly, as:
+    #
+    #       step_size = (x_max - x_min) / n_samples = (R - eps) / n_samples
+    #
+    # A log-log plot of error vs. step_size makes the 4th-order slope
+    # visually obvious alongside the printed table.
     # -------------------------------------------------------------
     print("\n" + "="*70)
     print("Convergence study (max nodal error vs exact solution, fixed-step RK4)")
     print("="*70)
 
+    RK4_EPS = 1e-8  # matches the default eps used inside rk4_integrate
+
     convergence_data = {}
     for m_test, exact_fn in [(1.0, lambda x: np.where(x < 1e-8, 1.0, np.sin(x)/(x+1e-15))),
                               (5.0, lambda x: 1.0/np.sqrt(1.0 + x**2/3.0))]:
         print(f"\n m = {m_test}")
-        print(f"{'n_steps':>8} {'Max Error':>15} {'Observed Order':>16}")
+        print(f"{'n_samples':>10} {'Step Size':>15} {'Max Error':>15} {'Observed Order':>16}")
         prev_err, prev_h = None, None
         h_list, err_list = [], []
-        for n_steps in [10, 20, 40, 80, 160]:
-            x_grid, y_grid, _ = rk4_integrate(m_test, R, n_steps)
+        for n_samples in [10, 20, 40, 80, 160]:
+            x_grid, y_grid, _ = rk4_integrate(m_test, R, n_samples, eps=RK4_EPS)
             err = np.max(np.abs(y_grid - exact_fn(x_grid)))
-            h = R / n_steps
+            # Step size computed internally, never supplied manually:
+            #   step_size = (x_max - x_min) / n_samples
+            h = (R - RK4_EPS) / n_samples
             h_list.append(h); err_list.append(err)
             order = np.log(prev_err/err)/np.log(prev_h/h) if prev_err else np.nan
             order_s = f"{order:.2f}" if not np.isnan(order) else "  --"
-            print(f"{n_steps:>8} {err:>15.3e} {order_s:>16}")
+            print(f"{n_samples:>10} {h:>15.3e} {err:>15.3e} {order_s:>16}")
             prev_err, prev_h = err, h
         convergence_data[m_test] = (h_list, err_list)
 
@@ -407,7 +443,7 @@ if __name__ == "__main__":
     h_ref = np.array(sorted(convergence_data[1.0][0]))
     err_ref = convergence_data[1.0][1][-1] * (h_ref / convergence_data[1.0][0][-1]) ** 4
     ax.loglog(h_ref, err_ref, 'k--', label='O(h^4) reference')
-    ax.set_xlabel('Step size h')
+    ax.set_xlabel('Step size h (= (x_max - x_min) / n_samples)')
     ax.set_ylabel('Max nodal error vs. exact solution')
     ax.set_title(f'{TAG} - RK4 Convergence (log-log)')
     ax.legend()
