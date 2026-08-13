@@ -3,9 +3,9 @@ import os
 import io
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_agg import FigureCanvasAgg as AggCanvas
 from matplotlib.figure import Figure
 
 from PyQt5.QtWidgets import (
@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QRadioButton, QScrollArea, QFileDialog, QMessageBox, QGridLayout,
     QStackedWidget, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
 
 try:
     import docx
@@ -50,6 +50,29 @@ except ImportError:
     except ImportError:
         SOLVERS_AVAILABLE = False
 
+# Safely import all isothermal solver modules
+try:
+    import solvers.finite_difference_isothermal as fdm_iso
+    import solvers.finite_element_isothermal as fem_iso
+    import solvers.spectral_isothermal as spec_iso
+    import solvers.shooting_RK4_Isothermal as rk4_iso
+    import solvers.series_ADM_Isothermal as adm_iso
+    import solvers.b_spline_isothermal as bsp_iso
+    ISOTHERMAL_SOLVERS_AVAILABLE = True
+except ImportError:
+    try:
+        import finite_difference_isothermal as fdm_iso
+        import finite_element_isothermal as fem_iso
+        import spectral_isothermal as spec_iso
+        import shooting_RK4_Isothermal as rk4_iso
+        import series_ADM_Isothermal as adm_iso
+        import b_spline_isothermal as bsp_iso
+        ISOTHERMAL_SOLVERS_AVAILABLE = True
+    except ImportError:
+        ISOTHERMAL_SOLVERS_AVAILABLE = False
+
+import concurrent.futures
+import threading
 
 class MplCanvas(FigureCanvas):
     """In-memory Matplotlib Canvas for dynamic PyQt embedding"""
@@ -58,6 +81,307 @@ class MplCanvas(FigureCanvas):
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.updateGeometry()
+
+class WorkerSignals(QObject):
+    """Signals available from a running SolverWorker thread."""
+    finished = pyqtSignal(list, dict, list)   # plot_queue, export_tables, warning_messages
+    error = pyqtSignal(str)                   # fatal/unexpected exception message
+
+class SolverWorker(QThread):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.show_iterations = config.get('show_iterations', False)
+        self.signals = WorkerSignals()
+        self.plot_queue = []
+        self.export_tables = {}
+        # Guards plot_queue/export_tables since multiple solver threads write
+        # to them concurrently via ThreadPoolExecutor.
+        self._lock = threading.Lock()
+
+    def run(self):
+        try:
+            messages = []
+            cfg = self.config
+            futures = []
+
+            # Using ThreadPoolExecutor to run selected methods simultaneously
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                p1 = cfg['p1']
+                if p1['enabled']:
+                    if not ISOTHERMAL_SOLVERS_AVAILABLE:
+                        messages.append("Could not import isothermal solver scripts.")
+                    else:
+                        param_vals = np.linspace(p1['min'], p1['max'], p1['samples']) if p1['samples'] > 0 else np.array([p1['min']])
+                        xmax, max_iter, n_elem, ea, et, series_terms, bspline_p = (
+                            p1['xmax'], p1['max_iter'], p1['grid_pts'], p1['ea'], p1['et'],
+                            p1['series_terms'], p1['bspline_p']
+                        )
+                        methods = p1['methods']
+
+                        if methods.get("FDM"):
+                            futures.append(executor.submit(self.run_fdm_isothermal, param_vals, xmax, max_iter, n_elem, ea, et))
+                        if methods.get("FEM"):
+                            futures.append(executor.submit(self.run_fem_isothermal, param_vals, xmax, max_iter, n_elem, ea, et))
+                        if methods.get("Chebyshev"):
+                            futures.append(executor.submit(self.run_spectral_isothermal, param_vals, xmax, max_iter, n_elem, ea, et))
+                        if methods.get("Shooting"):
+                            futures.append(executor.submit(self.run_rk4_isothermal, param_vals, xmax, max_iter, n_elem, ea, et))
+                        if methods.get("ADM"):
+                            futures.append(executor.submit(self.run_adm_isothermal, param_vals, xmax, max_iter, n_elem, series_terms, et))
+                        if methods.get("B-Spline"):
+                            futures.append(executor.submit(self.run_bspline_isothermal, param_vals, xmax, max_iter, n_elem, ea, et, bspline_p))
+
+                p2 = cfg['p2']
+                if p2['enabled']:
+                    if not SOLVERS_AVAILABLE:
+                        messages.append("Could not import polytropic solver scripts.")
+                    else:
+                        param_vals = np.linspace(p2['min'], p2['max'], p2['samples']) if p2['samples'] > 0 else np.array([p2['min']])
+                        xmax, max_iter, n_elem, ea, et, series_terms, bspline_p = (
+                            p2['xmax'], p2['max_iter'], p2['grid_pts'], p2['ea'], p2['et'],
+                            p2['series_terms'], p2['bspline_p']
+                        )
+                        methods = p2['methods']
+
+                        if methods.get("FDM"):
+                            futures.append(executor.submit(self.run_fdm_solver, param_vals, xmax, max_iter, n_elem, ea, et))
+                        if methods.get("FEM"):
+                            futures.append(executor.submit(self.run_fem_solver, param_vals, xmax, max_iter, n_elem, ea, et))
+                        if methods.get("Chebyshev"):
+                            futures.append(executor.submit(self.run_spectral_solver, param_vals, xmax, max_iter, n_elem, ea, et))
+                        if methods.get("Shooting"):
+                            futures.append(executor.submit(self.run_rk4_solver, param_vals, xmax, max_iter, n_elem, ea, et))
+                        if methods.get("ADM"):
+                            futures.append(executor.submit(self.run_adm_solver, param_vals, xmax, max_iter, n_elem, series_terms, et))
+                        if methods.get("B-Spline"):
+                            futures.append(executor.submit(self.run_bspline_solver, param_vals, xmax, max_iter, n_elem, ea, et, bspline_p))
+
+                # Wait for all parallel tasks to finish and catch any exceptions
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        messages.append(f"Solver Error: {str(e)}")
+
+            self.signals.finished.emit(self.plot_queue, self.export_tables, messages)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+    # -------------------------------------------------------------------------
+    # In-Memory Plotting Engine
+    # -------------------------------------------------------------------------
+    def queue_surface_plot(self, X, Y, Z, xlabel, ylabel, zlabel, title, cmap, int_y=False):
+        with self._lock:
+            self.plot_queue.append({
+                'X': X, 'Y': Y, 'Z': Z, 'xlabel': xlabel, 'ylabel': ylabel,
+                'zlabel': zlabel, 'title': title, 'cmap': cmap, 'int_y': int_y
+            })
+
+    def _plot_standard_results(self, method_name, module, param_vals, results, settings, is_isothermal=False):
+        nodes_common = results[param_vals[0]]['nodes']
+        Xg, Mg = np.meshgrid(nodes_common, param_vals)
+        tag = "Isothermal" if is_isothermal else "Polytropic"
+        param_label = "Parameter (\u03bb)" if is_isothermal else "Parameter (m)"
+
+        Zfinal = np.array([results[m]['Y'] for m in param_vals])
+        Zref = np.array([results[m]['ref_hi'] for m in param_vals])
+        Zabs_err = np.abs(Zfinal - Zref)
+        Zrel_err = np.array([module.rel_err(results[m]['Y'], results[m]['ref_hi']) for m in param_vals])
+        with np.errstate(divide='ignore', invalid='ignore'):
+            Zlog_err = np.nan_to_num(np.log10(np.clip(Zrel_err, 1e-16, None)), neginf=-16.0)
+
+        Zapprox_err = []
+        for m in param_vals:
+            history_nodes = results[m].get('history_nodes', [])
+            if len(history_nodes) >= 2:
+                Zapprox_err.append(np.abs(np.asarray(history_nodes[-1]) - np.asarray(history_nodes[-2])))
+            else:
+                Zapprox_err.append(np.zeros_like(nodes_common, dtype=float))
+        Zapprox_err = np.array(Zapprox_err)
+
+        self.queue_surface_plot(Xg, Mg, Zfinal, 'x value', param_label, 'Final Nodal Values', f'{method_name} {tag} - Final Numerical Values', 'viridis')
+        self.queue_surface_plot(Xg, Mg, Zref, 'x value', param_label, 'Analytical Reference', f'{method_name} {tag} - Final Analytical Reference', 'cividis')
+        self.queue_surface_plot(Xg, Mg, Zabs_err, 'x value', param_label, 'Absolute True Error', f'{method_name} {tag} - Final Absolute True Error', 'inferno')
+        self.queue_surface_plot(Xg, Mg, Zrel_err, 'x value', param_label, 'Relative True Error', f'{method_name} {tag} - Final Relative True Error', 'plasma')
+        self.queue_surface_plot(Xg, Mg, Zlog_err, 'x value', param_label, 'Log10 Relative True Error', f'{method_name} {tag} - Final Log10 Relative True Error', 'magma')
+        self.queue_surface_plot(Xg, Mg, Zapprox_err, 'x value', param_label, 'Approximate Error (E_a)', f'{method_name} {tag} - Final Approximate Error Surface', 'plasma')
+
+        max_rel_err = Zrel_err.max(axis=1)
+        Ztrend_err = np.tile(max_rel_err.reshape(-1, 1), (1, Xg.shape[1]))
+        self.queue_surface_plot(Xg, Mg, Ztrend_err, 'x value', param_label, 'Max Relative Error', f'{method_name} {tag} - Max Relative Error Trend', 'plasma')
+
+        mean_abs_err = Zabs_err.mean(axis=1)
+        Zmean_err = np.tile(mean_abs_err.reshape(-1, 1), (1, Xg.shape[1]))
+        self.queue_surface_plot(Xg, Mg, Zmean_err, 'x value', param_label, 'Mean Absolute Error', f'{method_name} {tag} - Mean Absolute Error Trend', 'inferno')
+
+        dense_nodes = np.linspace(nodes_common[0], nodes_common[-1], max(4 * len(nodes_common), 100))
+        for m in param_vals:
+            Y_m, ref_m = results[m]['Y'], results[m]['ref_hi']
+            dense_ref = np.interp(dense_nodes, nodes_common, ref_m)
+            dense_num = np.interp(dense_nodes, nodes_common, Y_m)
+            Xd, Rd = np.meshgrid(dense_nodes, [0, 1])
+
+            self.queue_surface_plot(Xd, Rd, np.tile(dense_ref, (2, 1)), 'x value (dense)', '', 'Analytical Value', f'{method_name} {tag} - Dense Analytical Curve ({param_label}={m:.2f})', 'cividis')
+            self.queue_surface_plot(Xd, Rd, np.tile(dense_num, (2, 1)), 'x value (dense)', '', 'Numerical Value', f'{method_name} {tag} - Dense Numerical Curve ({param_label}={m:.2f})', 'viridis')
+            dense_abs = np.abs(dense_num - dense_ref)
+            self.queue_surface_plot(Xd, Rd, np.tile(dense_abs, (2, 1)), 'x value (dense)', '', 'Absolute Error', f'{method_name} {tag} - Dense Absolute Error Curve ({param_label}={m:.2f})', 'inferno')
+            dense_rel = dense_abs / np.clip(np.abs(dense_ref), 1e-12, None)
+            self.queue_surface_plot(Xd, Rd, np.tile(dense_rel, (2, 1)), 'x value (dense)', '', 'Relative Error', f'{method_name} {tag} - Dense Relative Error Curve ({param_label}={m:.2f})', 'plasma')
+
+        if self.show_iterations:
+            rep_m = param_vals[-1]
+            history_nodes = results[rep_m].get('history_nodes', [])
+            if history_nodes:
+                ref_hi = results[rep_m]['ref_hi']
+                iters = np.arange(len(history_nodes))
+                Xi, Ii = np.meshgrid(nodes_common, iters)
+                Zval = np.array(history_nodes)
+                Zerr = np.array([module.rel_err(hh, ref_hi) for hh in history_nodes])
+                Zabs_i = np.abs(Zval - ref_hi)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    Zlog_i = np.nan_to_num(np.log10(np.clip(Zerr, 1e-16, None)), neginf=-16.0)
+
+                self.queue_surface_plot(Xi, Ii, Zval, 'x value', 'Iteration Number', 'Iterative Nodal Values', f'{method_name} {tag} - Iterative Nodal Values ({param_label}={rep_m:.2f})', 'viridis', True)
+                self.queue_surface_plot(Xi, Ii, Zerr, 'x value', 'Iteration Number', 'Iterative Relative Error', f'{method_name} {tag} - Iterative Relative Error ({param_label}={rep_m:.2f})', 'plasma', True)
+                self.queue_surface_plot(Xi, Ii, Zabs_i, 'x value', 'Iteration Number', 'Iterative Absolute Error', f'{method_name} {tag} - Iterative Absolute Error ({param_label}={rep_m:.2f})', 'inferno', True)
+                self.queue_surface_plot(Xi, Ii, Zlog_i, 'x value', 'Iteration Number', 'Iterative Log10 Relative Error', f'{method_name} {tag} - Iterative Log10 Relative Error ({param_label}={rep_m:.2f})', 'magma', True)
+
+        settings_df = pd.DataFrame({
+            param_label: param_vals,
+            'xmax': settings.get('xmax'),
+            'grid_pts': settings.get('grid_pts'),
+            'max_iter': settings.get('max_iter'),
+            'ea': settings.get('ea'),
+            'et': settings.get('et'),
+            'bspline_degree_p': settings.get('p', 'N/A'),
+            'series_terms': settings.get('series_terms', 'N/A'),
+        })
+        final_nodes_df = pd.DataFrame(Zfinal, index=[f"{m:.4f}" for m in param_vals], columns=[f"x={x:.4f}" for x in nodes_common])
+        error_summary_df = pd.DataFrame({
+            param_label: param_vals,
+            'Max_Relative_Error': Zrel_err.max(axis=1),
+            'Mean_Relative_Error': Zrel_err.mean(axis=1),
+            'Max_Absolute_Error': Zabs_err.max(axis=1),
+            'Mean_Absolute_Error': Zabs_err.mean(axis=1),
+        })
+
+        with self._lock:
+            self.export_tables[f"{method_name}_{tag}_Settings"] = settings_df
+            self.export_tables[f"{method_name}_{tag}_Final_Nodes"] = final_nodes_df
+            self.export_tables[f"{method_name}_{tag}_Error_Summary"] = error_summary_df
+
+    # -------------------------------------------------------------------------
+    # Polytropic Solver Interfaces
+    # -------------------------------------------------------------------------
+    def run_fdm_solver(self, param_vals, xmax, max_iter, n_elem, ea, et):
+        res = {}
+        for m in param_vals:
+            nodes, c, history, *_ = fdm_poly.solve_polytropic_fdm(m, n_elem=n_elem, R=xmax, max_iter=max_iter, tol=ea)
+            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': fdm_poly.get_reference_solution(m, nodes)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et}
+        self._plot_standard_results("FDM", fdm_poly, param_vals, res, settings)
+
+    def run_fem_solver(self, param_vals, xmax, max_iter, n_elem, ea, et):
+        res = {}
+        for m in param_vals:
+            nodes, c, history, *_ = fem_poly.solve_polytropic_fem(m, n_elem=n_elem, R=xmax, max_iter=max_iter, tol_step=ea, tol_resid=ea)
+            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': fem_poly.get_true_reference(m, nodes)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et}
+        self._plot_standard_results("FEM", fem_poly, param_vals, res, settings)
+
+    def run_spectral_solver(self, param_vals, xmax, max_iter, n_elem, ea, et):
+        res = {}
+        for m in param_vals:
+            nodes, c, history, *_ = spec_poly.solve_polytropic_spectral(m, N=n_elem, R=xmax, max_iter=max_iter, tol=ea)
+            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': spec_poly.get_true_reference(m, nodes)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et}
+        self._plot_standard_results("Chebyshev", spec_poly, param_vals, res, settings)
+
+    def run_rk4_solver(self, param_vals, xmax, max_iter, n_elem, ea, et):
+        res = {}
+        for m in param_vals:
+            nodes, c, history, *_ = rk4_poly.solve_polytropic_rk4(m, n_nodes=n_elem, R=xmax, max_iter=max_iter, tol=ea)
+            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': rk4_poly.get_true_reference(m, nodes)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et}
+        self._plot_standard_results("Shooting", rk4_poly, param_vals, res, settings)
+
+    def run_adm_solver(self, param_vals, xmax, max_iter, n_elem, series_terms, et):
+        res = {}
+        for m in param_vals:
+            _, nodes, c, history, *_ = adm_poly.solve_polytropic_adm(m, n_samples=n_elem, x_max=xmax, max_iter=max_iter, N_series=series_terms)
+            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': adm_poly.get_true_reference(m, nodes)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'et': et, 'series_terms': series_terms}
+        self._plot_standard_results("ADM", adm_poly, param_vals, res, settings)
+
+    def run_bspline_solver(self, param_vals, xmax, max_iter, n_elem, ea, et, p):
+        res = {}
+        _, _, tau_m, M0_m, *_ = bsp_poly.build_bspline_operator(p, n_elem, xmax)
+        for m in param_vals:
+            t, tau, Y_final, history, *_ = bsp_poly.solve_polytropic_bspline(m, p=p, n_elem=n_elem, R=xmax, max_iter=max_iter, tol=ea)
+            res[m] = {'nodes': tau, 'Y': Y_final, 'history_nodes': [M0_m @ h for h in history], 'ref_hi': bsp_poly.get_true_reference(m, tau)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et, 'p': p}
+        self._plot_standard_results("B-Spline", bsp_poly, param_vals, res, settings)
+
+    # -------------------------------------------------------------------------
+    # Isothermal Solver Interfaces
+    # -------------------------------------------------------------------------
+    def run_fdm_isothermal(self, param_vals, xmax, max_iter, n_elem, ea, et):
+        res = {}
+        for lam in param_vals:
+            nodes, c, history, *_ = fdm_iso.solve_isothermal_fdm(lam, n_elem=n_elem, R=xmax, max_iter=max_iter, tol=ea)
+            res[lam] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': fdm_iso.get_reference_solution(lam, nodes)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et}
+        self._plot_standard_results("FDM", fdm_iso, param_vals, res, settings, True)
+
+    def run_fem_isothermal(self, param_vals, xmax, max_iter, n_elem, ea, et):
+        res = {}
+        for lam in param_vals:
+            nodes, c, history, *_ = fem_iso.solve_isothermal_fem(lam, n_elem=n_elem, R=xmax, max_iter=max_iter, tol_step=ea, tol_resid=ea)
+            res[lam] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': fem_iso.get_true_reference(lam, nodes)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et}
+        self._plot_standard_results("FEM", fem_iso, param_vals, res, settings, True)
+
+    def run_spectral_isothermal(self, param_vals, xmax, max_iter, n_elem, ea, et):
+        res = {}
+        for lam in param_vals:
+            nodes, c, history, *_ = spec_iso.solve_isothermal_spectral(lam, N=n_elem, R=xmax, max_iter=max_iter, tol=ea)
+            res[lam] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': spec_iso.get_true_reference(lam, nodes)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et}
+        self._plot_standard_results("Chebyshev", spec_iso, param_vals, res, settings, True)
+
+    def run_rk4_isothermal(self, param_vals, xmax, max_iter, n_elem, ea, et):
+        res = {}
+        for lam in param_vals:
+            nodes, c, history, *_ = rk4_iso.solve_isothermal_shooting_rk4(n_nodes=n_elem, R=xmax, max_iter=max_iter, tol=ea)
+            res[lam] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': rk4_iso.get_true_reference(nodes, R=xmax)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et}
+        self._plot_standard_results("Shooting", rk4_iso, param_vals, res, settings, True)
+
+    def run_adm_isothermal(self, param_vals, xmax, max_iter, n_elem, series_terms, et):
+        res = {}
+        for lam in param_vals:
+            psi_all, _ = adm_iso.adm_series_isothermal(series_terms)
+            S_all = adm_iso.partial_sums(psi_all)
+            S_funcs = adm_iso.build_partial_sum_functions(S_all)
+
+            nodes = np.linspace(0.0, xmax, n_elem)
+            res[lam] = {
+                'nodes': nodes, 'Y': S_funcs[-1](nodes), 
+                'history_nodes': [f(nodes) for f in S_funcs], 
+                'ref_hi': adm_iso.get_true_reference(nodes)
+            }
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'et': et, 'series_terms': series_terms}
+        self._plot_standard_results("ADM", adm_iso, param_vals, res, settings, True)
+
+    def run_bspline_isothermal(self, param_vals, xmax, max_iter, n_elem, ea, et, p):
+        res = {}
+        _, _, tau_m, M0_m, *_ = bsp_iso.build_bspline_operator(p, n_elem, xmax)
+        for lam in param_vals:
+            t, tau, Y_final, history, *_ = bsp_iso.solve_isothermal_bspline(lam, p=p, n_elem=n_elem, R=xmax, max_iter=max_iter, tol=ea)
+            res[lam] = {'nodes': tau, 'Y': Y_final, 'history_nodes': [M0_m @ h for h in history], 'ref_hi': bsp_iso.get_true_reference(lam, tau)}
+        settings = {'xmax': xmax, 'grid_pts': n_elem, 'max_iter': max_iter, 'ea': ea, 'et': et, 'p': p}
+        self._plot_standard_results("B-Spline", bsp_iso, param_vals, res, settings, True)
 
 
 class LaneEmdenGUI(QMainWindow):
@@ -76,34 +400,83 @@ class LaneEmdenGUI(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
-        self.setStyleSheet("""
-            QWidget { background-color: #121212; color: #E0E0E0; font-family: 'Segoe UI', Arial, sans-serif; }
-            QGroupBox { font-weight: bold; border: 1px solid #333; margin-top: 15px; padding-top: 15px; border-radius: 6px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 8px; color: #FF5722; font-size: 13px; }
-            QPushButton { background-color: #262626; border: 1px solid #444; padding: 10px; border-radius: 5px; font-weight: bold; }
-            QPushButton:hover { background-color: #333333; border-color: #666; }
-            #RunButton { background-color: #D84315; color: white; font-size: 16px; font-weight: bold; border: none; min-height: 50px; }
-            #RunButton:hover { background-color: #F4511E; }
-            #NavButton { background-color: #0288D1; color: white; border: none; min-height: 35px; font-size: 14px; }
-            #NavButton:hover { background-color: #039BE5; }
+        self.is_dark_mode = True
+
+        # Professional Green Themes
+        self.dark_theme = """
+            QWidget { background-color: #121212; color: #E0E0E0; font-family: 'Segoe UI', system-ui, sans-serif; }
+            QGroupBox { font-weight: bold; border: 1px solid #333333; margin-top: 15px; padding-top: 20px; border-radius: 8px; background-color: #1E1E1E; }
+            QGroupBox::title { subcontrol-origin: margin; left: 15px; padding: 0 5px; color: #4CAF50; font-size: 14px; }
+            QPushButton { background-color: #2D2D2D; border: 1px solid #404040; padding: 10px; border-radius: 6px; font-weight: 600; color: #E0E0E0; }
+            QPushButton:hover { background-color: #3D3D3D; border-color: #4CAF50; }
+            #RunButton { background-color: #2E7D32; color: white; font-size: 16px; font-weight: bold; border: none; min-height: 50px; border-radius: 8px; }
+            #RunButton:hover { background-color: #388E3C; }
+            #RunButton:disabled { background-color: #1B5E20; color: #888888; }
+            #NavButton { background-color: #37474F; color: white; border: none; min-height: 35px; font-size: 14px; border-radius: 6px; }
+            #NavButton:hover { background-color: #455A64; }
             #ExportButton { min-height: 45px; font-size: 13px; }
-            QDoubleSpinBox, QSpinBox { background-color: #1E1E1E; border: 1px solid #333; padding: 6px; border-radius: 4px; color: #FFF; }
+            #ThemeToggle { background-color: transparent; color: #4CAF50; border: 1px solid #4CAF50; font-size: 13px; }
+            #ThemeToggle:hover { background-color: #1B5E20; }
+            QDoubleSpinBox, QSpinBox { background-color: #2D2D2D; border: 1px solid #404040; padding: 6px; border-radius: 4px; color: #FFF; }
+            QDoubleSpinBox:focus, QSpinBox:focus { border: 1px solid #4CAF50; }
             QCheckBox { spacing: 8px; }
-            QCheckBox::indicator { width: 18px; height: 18px; border-radius: 3px; border: 1px solid #555; background-color: #1E1E1E; }
-            QCheckBox::indicator:checked { background-color: #FF5722; border-color: #FF5722; }
-        """)
+            QCheckBox::indicator { width: 18px; height: 18px; border-radius: 4px; border: 1px solid #555; background-color: #2D2D2D; }
+            QCheckBox::indicator:checked { background-color: #4CAF50; border-color: #4CAF50; }
+            QRadioButton { spacing: 8px; }
+            QRadioButton::indicator { width: 18px; height: 18px; border-radius: 9px; border: 1px solid #555; background-color: #2D2D2D; }
+            QRadioButton::indicator:checked { background-color: #4CAF50; border-color: #4CAF50; }
+            QScrollArea { border: none; }
+        """
+
+        self.light_theme = """
+            QWidget { background-color: #F5F7FA; color: #212529; font-family: 'Segoe UI', system-ui, sans-serif; }
+            QGroupBox { font-weight: bold; border: 1px solid #DEE2E6; margin-top: 15px; padding-top: 20px; border-radius: 8px; background-color: #FFFFFF; }
+            QGroupBox::title { subcontrol-origin: margin; left: 15px; padding: 0 5px; color: #2E7D32; font-size: 14px; }
+            QPushButton { background-color: #FFFFFF; border: 1px solid #CED4DA; padding: 10px; border-radius: 6px; font-weight: 600; color: #495057; }
+            QPushButton:hover { background-color: #E9ECEF; border-color: #2E7D32; color: #212529; }
+            #RunButton { background-color: #4CAF50; color: white; font-size: 16px; font-weight: bold; border: none; min-height: 50px; border-radius: 8px; }
+            #RunButton:hover { background-color: #43A047; }
+            #RunButton:disabled { background-color: #A5D6A7; color: #FFFFFF; }
+            #NavButton { background-color: #607D8B; color: white; border: none; min-height: 35px; font-size: 14px; border-radius: 6px; }
+            #NavButton:hover { background-color: #546E7A; }
+            #ExportButton { min-height: 45px; font-size: 13px; }
+            #ThemeToggle { background-color: transparent; color: #2E7D32; border: 1px solid #2E7D32; font-size: 13px; }
+            #ThemeToggle:hover { background-color: #E8F5E9; }
+            QDoubleSpinBox, QSpinBox { background-color: #FFFFFF; border: 1px solid #CED4DA; padding: 6px; border-radius: 4px; color: #212529; }
+            QDoubleSpinBox:focus, QSpinBox:focus { border: 1px solid #2E7D32; }
+            QCheckBox { spacing: 8px; }
+            QCheckBox::indicator { width: 18px; height: 18px; border-radius: 4px; border: 1px solid #CED4DA; background-color: #FFFFFF; }
+            QCheckBox::indicator:checked { background-color: #2E7D32; border-color: #2E7D32; }
+            QRadioButton { spacing: 8px; }
+            QRadioButton::indicator { width: 18px; height: 18px; border-radius: 9px; border: 1px solid #CED4DA; background-color: #FFFFFF; }
+            QRadioButton::indicator:checked { background-color: #2E7D32; border-color: #2E7D32; }
+            QScrollArea { border: none; }
+        """
+
+        self.setStyleSheet(self.dark_theme)
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.main_widget = QWidget()
         self.main_layout = QVBoxLayout(self.main_widget)
-        self.main_layout.setContentsMargins(20, 20, 20, 20)
-        self.main_layout.setSpacing(15)
+        self.main_layout.setContentsMargins(30, 30, 30, 30)
+        self.main_layout.setSpacing(20)
 
+        # Header Layout with Toggle Button
+        header_layout = QHBoxLayout()
         header = QLabel("Lane-Emden Numerical Methods Lab")
-        header.setStyleSheet("font-size: 28px; font-weight: bold; font-family: Georgia, serif; color: #FFFFFF; margin-bottom: 10px;")
-        header.setAlignment(Qt.AlignCenter)
-        self.main_layout.addWidget(header)
+        header.setStyleSheet("font-size: 28px; font-weight: 800; font-family: 'Segoe UI', sans-serif; margin-bottom: 10px;")
+        
+        self.btn_theme = QPushButton("☀️ Light Mode")
+        self.btn_theme.setObjectName("ThemeToggle")
+        self.btn_theme.setCursor(Qt.PointingHandCursor)
+        self.btn_theme.setFixedWidth(120)
+        self.btn_theme.clicked.connect(self.toggle_theme)
+
+        header_layout.addWidget(header)
+        header_layout.addStretch()
+        header_layout.addWidget(self.btn_theme)
+        self.main_layout.addLayout(header_layout)
 
         split_layout = QHBoxLayout()
         self.p1_panel = self.build_problem_panel("Problem 1: Isothermal Gas Sphere", "Lambda (λ)")
@@ -122,7 +495,7 @@ class LaneEmdenGUI(QMainWindow):
         
         self.placeholder = QLabel("Configure parameters and click RUN SOLVERS to generate 3D figures.")
         self.placeholder.setAlignment(Qt.AlignCenter)
-        self.placeholder.setStyleSheet("border: 2px dashed #444; color: #888; font-size: 16px; border-radius: 8px;")
+        self.placeholder.setStyleSheet("border: 2px dashed #888888; color: #888888; font-size: 16px; border-radius: 8px;")
         self.gallery_stack.addWidget(self.placeholder)
         
         self.canvas = MplCanvas(self, width=8, height=6, dpi=100)
@@ -133,14 +506,16 @@ class LaneEmdenGUI(QMainWindow):
         nav_layout = QHBoxLayout()
         self.btn_prev_fig = QPushButton("◄ Previous Figure")
         self.btn_prev_fig.setObjectName("NavButton")
+        self.btn_prev_fig.setCursor(Qt.PointingHandCursor)
         self.btn_prev_fig.clicked.connect(self.show_previous_figure)
         
         self.lbl_fig_status = QLabel("Figure 0 / 0")
         self.lbl_fig_status.setAlignment(Qt.AlignCenter)
-        self.lbl_fig_status.setStyleSheet("font-weight: bold; font-size: 15px; color: #FFF;")
+        self.lbl_fig_status.setStyleSheet("font-weight: bold; font-size: 15px;")
 
         self.btn_next_fig = QPushButton("Next Figure ►")
         self.btn_next_fig.setObjectName("NavButton")
+        self.btn_next_fig.setCursor(Qt.PointingHandCursor)
         self.btn_next_fig.clicked.connect(self.show_next_figure)
 
         nav_layout.addWidget(self.btn_prev_fig, stretch=1)
@@ -156,6 +531,20 @@ class LaneEmdenGUI(QMainWindow):
         self.scroll_area.setWidget(self.main_widget)
         self.setCentralWidget(self.scroll_area)
 
+    def toggle_theme(self):
+        if self.is_dark_mode:
+            self.setStyleSheet(self.light_theme)
+            self.btn_theme.setText("🌙 Dark Mode")
+            self.is_dark_mode = False
+        else:
+            self.setStyleSheet(self.dark_theme)
+            self.btn_theme.setText("☀️ Light Mode")
+            self.is_dark_mode = True
+            
+        # Re-render current figure immediately to apply theme to Matplotlib canvas
+        if self.plot_queue:
+            self.render_figure_at_index(self.current_fig_index)
+
     def build_problem_panel(self, title, param_label):
         group = QGroupBox(title)
         layout = QVBoxLayout()
@@ -163,7 +552,7 @@ class LaneEmdenGUI(QMainWindow):
 
         enable_cb = QCheckBox("Enabled")
         enable_cb.setChecked(True)
-        enable_cb.setStyleSheet("color: #FF5722; font-weight: bold; font-size: 14px;")
+        enable_cb.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 14px;")
         layout.addWidget(enable_cb, alignment=Qt.AlignRight)
 
         methods_gb = QGroupBox("NUMERICAL METHODS")
@@ -197,8 +586,6 @@ class LaneEmdenGUI(QMainWindow):
 
         min_sp = QDoubleSpinBox(); min_sp.setValue(1.0)
         max_sp = QDoubleSpinBox(); max_sp.setValue(5.0)
-        
-        # Updated to request Samples instead of Step
         samples_sp = QSpinBox(); samples_sp.setValue(4); samples_sp.setMinimum(1); samples_sp.setMaximum(1000)
         
         p_layout.addWidget(min_sp, 2, 0)
@@ -234,8 +621,11 @@ class LaneEmdenGUI(QMainWindow):
         t_layout.addWidget(grid_pts_sp, 3, 1)
 
         t_layout.addWidget(QLabel("SERIES TERMS (ADM)"), 4, 0)
+        t_layout.addWidget(QLabel("B-SPLINE DEGREE (p)"), 4, 1)
         series_sp = QSpinBox(); series_sp.setMaximum(500); series_sp.setValue(20)
+        bspline_p_sp = QSpinBox(); bspline_p_sp.setMinimum(1); bspline_p_sp.setMaximum(10); bspline_p_sp.setValue(3)
         t_layout.addWidget(series_sp, 5, 0)
+        t_layout.addWidget(bspline_p_sp, 5, 1)
 
         term_gb.setLayout(t_layout)
         layout.addWidget(term_gb)
@@ -246,7 +636,8 @@ class LaneEmdenGUI(QMainWindow):
             'min': min_sp, 'max': max_sp, 'samples': samples_sp,
             'xmax': xmax_sp, 'ytarget': ytarget_sp,
             'ea': ea_sp, 'et': et_sp, 'max_iter': max_iter_sp,
-            'grid_pts': grid_pts_sp, 'series_terms': series_sp
+            'grid_pts': grid_pts_sp, 'series_terms': series_sp,
+            'bspline_p': bspline_p_sp,
         }
 
     def build_execution_panel(self):
@@ -269,14 +660,19 @@ class LaneEmdenGUI(QMainWindow):
 
         self.radio_manual = QRadioButton("Manual / Step-by-Step")
 
+        self.chk_iter_history = QCheckBox("Generate Iteration History Plots")
+        self.chk_iter_history.setChecked(False)
+
         m_layout.addWidget(self.radio_oneshot)
         m_layout.addWidget(self.radio_delay)
         m_layout.addWidget(self.delay_spin)
         m_layout.addWidget(self.radio_manual)
+        m_layout.addWidget(self.chk_iter_history)
         modes_gb.setLayout(m_layout)
 
         self.btn_run = QPushButton("RUN SOLVERS")
         self.btn_run.setObjectName("RunButton")
+        self.btn_run.setCursor(Qt.PointingHandCursor)
         self.btn_run.clicked.connect(self.execute_solvers)
 
         layout.addWidget(modes_gb, stretch=2)
@@ -305,56 +701,64 @@ class LaneEmdenGUI(QMainWindow):
         panel.setLayout(layout)
         return panel
 
+    def _snapshot_panel_config(self, panel, show_iterations):
+        return {
+            'enabled': panel['enable'].isChecked(),
+            'min': panel['min'].value(),
+            'max': panel['max'].value(),
+            'samples': panel['samples'].value(),
+            'xmax': panel['xmax'].value(),
+            'max_iter': panel['max_iter'].value(),
+            'grid_pts': panel['grid_pts'].value(),
+            'ea': panel['ea'].value(),
+            'et': panel['et'].value(),
+            'series_terms': panel['series_terms'].value(),
+            'bspline_p': panel['bspline_p'].value(),
+            'methods': {name: cb.isChecked() for name, cb in panel['methods'].items()},
+            'show_iterations': show_iterations,
+        }
+
     def execute_solvers(self):
-        if not SOLVERS_AVAILABLE:
+        if not SOLVERS_AVAILABLE and not ISOTHERMAL_SOLVERS_AVAILABLE:
             QMessageBox.critical(self, "Import Error", "Could not import solver scripts. Ensure they are in the correct directory.")
             return
 
         self.timer.stop()
-        self.plot_queue.clear()
-        self.export_tables.clear()
         self.gallery_stack.setCurrentWidget(self.placeholder)
 
-        if self.p2_panel['enable'].isChecked():
-            p_min = self.p2_panel['min'].value()
-            p_max = self.p2_panel['max'].value()
-            p_samples = self.p2_panel['samples'].value()
-            
-            # Apply Professor's Exact Modification Formula
-            if p_samples > 0:
-                p_step = (p_max - p_min) / p_samples
-                param_vals = np.arange(p_min, p_max + (p_step/2), p_step)
-            else:
-                param_vals = np.array([p_min])
-            
-            xmax = self.p2_panel['xmax'].value()
-            max_iter = self.p2_panel['max_iter'].value()
-            n_elem = self.p2_panel['grid_pts'].value()
-            series_terms = self.p2_panel['series_terms'].value()
-            methods = self.p2_panel['methods']
+        show_iterations = self.chk_iter_history.isChecked()
+        config = {
+            'p1': self._snapshot_panel_config(self.p1_panel, show_iterations),
+            'p2': self._snapshot_panel_config(self.p2_panel, show_iterations),
+            'show_iterations': show_iterations,
+        }
 
-            for method_name, cb in methods.items():
-                if cb.isChecked():
-                    if method_name == "FDM" and hasattr(fdm_poly, 'solve_polytropic_fdm'):
-                        self.run_fdm_solver(param_vals, xmax, max_iter, n_elem)
-                    elif method_name == "FEM" and hasattr(fem_poly, 'solve_polytropic_fem'):
-                        self.run_fem_solver(param_vals, xmax, max_iter, n_elem)
-                    elif method_name == "Chebyshev" and hasattr(spec_poly, 'solve_polytropic_spectral'):
-                        self.run_spectral_solver(param_vals, xmax, max_iter, n_elem)
-                    elif method_name == "Shooting" and hasattr(rk4_poly, 'solve_polytropic_rk4'):
-                        self.run_rk4_solver(param_vals, xmax, max_iter, n_elem)
-                    elif method_name == "ADM" and hasattr(adm_poly, 'solve_polytropic_adm'):
-                        self.run_adm_solver(param_vals, xmax, max_iter, n_elem, series_terms)
-                    elif method_name == "B-Spline" and hasattr(bsp_poly, 'solve_polytropic_bspline'):
-                        self.run_bspline_solver(param_vals, xmax, max_iter, n_elem)
+        self.btn_run.setEnabled(False)
+        self.btn_run.setText("CALCULATING...")
+        self.lbl_fig_status.setText("Calculating... Please wait")
+
+        self.worker = SolverWorker(config)
+        self.worker.signals.finished.connect(self.on_solvers_finished)
+        self.worker.signals.error.connect(self.on_solver_error)
+        self.worker.start()
+
+    def on_solvers_finished(self, plot_queue, export_tables, messages):
+        self.btn_run.setEnabled(True)
+        self.btn_run.setText("RUN SOLVERS")
+
+        for msg in messages:
+            QMessageBox.critical(self, "Import Error", msg)
+
+        self.plot_queue = plot_queue
+        self.export_tables = export_tables
 
         if not self.plot_queue:
+            self.lbl_fig_status.setText("Figure 0 / 0")
             QMessageBox.information(self, "No Output", "No active methods or problems were selected.")
             return
 
         self.current_fig_index = 0
 
-        # Run Modes Logic
         if self.radio_oneshot.isChecked():
             self.render_figure_at_index(len(self.plot_queue) - 1)
         elif self.radio_delay.isChecked():
@@ -364,136 +768,63 @@ class LaneEmdenGUI(QMainWindow):
         elif self.radio_manual.isChecked():
             self.render_figure_at_index(0)
 
-    # -------------------------------------------------------------------------
-    # In-Memory Plotting Engine 
-    # -------------------------------------------------------------------------
-    def queue_surface_plot(self, X, Y, Z, xlabel, ylabel, zlabel, title, cmap, int_y=False):
-        """Stores plot configuration in memory instead of saving to disk"""
-        self.plot_queue.append({
-            'X': X, 'Y': Y, 'Z': Z,
-            'xlabel': xlabel, 'ylabel': ylabel, 'zlabel': zlabel,
-            'title': title, 'cmap': cmap, 'int_y': int_y
-        })
-
-    def _plot_standard_results(self, method_name, module, param_vals, results):
-        nodes_common = results[param_vals[0]]['nodes']
-        Xg, Mg = np.meshgrid(nodes_common, param_vals)
-        
-        Zfinal = np.array([results[m]['Y'] for m in param_vals])
-        self.queue_surface_plot(
-            Xg, Mg, Zfinal, 
-            'x value', 'Parameter (m)', 'Final Nodal Values', 
-            f'{method_name} Polytropic - Final Nodal Values', 'viridis'
-        )
-
-        Zerr_hi = np.array([module.rel_err(results[m]['Y'], results[m]['ref_hi']) for m in param_vals])
-        self.queue_surface_plot(
-            Xg, Mg, Zerr_hi, 
-            'x value', 'Parameter (m)', 'Relative True Error', 
-            f'{method_name} Polytropic - Final Relative True Error', 'plasma'
-        )
-
-        # Plot EVERY iteration as requested
-        for idx, m in enumerate(param_vals):
-            history_nodes = results[m].get('history_nodes', [])
-            if not history_nodes:
-                continue 
-                
-            ref_hi = results[m]['ref_hi']
-            iters = np.arange(len(history_nodes))
-            Xi, Ii = np.meshgrid(nodes_common, iters)
-            
-            Zval = np.array(history_nodes)
-            Zerr = np.array([module.rel_err(hh, ref_hi) for hh in history_nodes])
-
-            self.queue_surface_plot(
-                Xi, Ii, Zval, 
-                'x value', 'Iteration Number', 'Iterative Nodal Values', 
-                f'{method_name} Polytropic - Iterative Nodal Values (m={m})', 'viridis', int_y=True
-            )
-            self.queue_surface_plot(
-                Xi, Ii, Zerr, 
-                'x value', 'Iteration Number', 'Relative True Error', 
-                f'{method_name} Polytropic - Iterative Relative Error (m={m})', 'plasma', int_y=True
-            )
-
-        df = pd.DataFrame(Zfinal, index=[f"m={m:.2f}" for m in param_vals], columns=[f"x={x:.2f}" for x in nodes_common])
-        self.export_tables[f"{method_name}_Final"] = df
+    def on_solver_error(self, message):
+        self.btn_run.setEnabled(True)
+        self.btn_run.setText("RUN SOLVERS")
+        self.lbl_fig_status.setText("Figure 0 / 0")
+        QMessageBox.critical(self, "Solver Error", f"An error occurred while running solvers:\n{message}")
 
     # -------------------------------------------------------------------------
-    # Solver Interfaces
-    # -------------------------------------------------------------------------
-    def run_fdm_solver(self, param_vals, xmax, max_iter, n_elem):
-        res = {}
-        for m in param_vals:
-            nodes, c, history, nit, conv = fdm_poly.solve_polytropic_fdm(m, n_elem=n_elem, R=xmax, max_iter=max_iter)
-            ref_hi = fdm_poly.get_reference_solution(m, nodes)
-            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': ref_hi}
-        self._plot_standard_results("FDM", fdm_poly, param_vals, res)
-
-    def run_fem_solver(self, param_vals, xmax, max_iter, n_elem):
-        res = {}
-        for m in param_vals:
-            nodes, c, history, nit = fem_poly.solve_polytropic_fem(m, n_elem=n_elem, R=xmax, max_iter=max_iter)
-            ref_hi = fem_poly.get_true_reference(m, nodes)
-            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': ref_hi}
-        self._plot_standard_results("FEM", fem_poly, param_vals, res)
-
-    def run_spectral_solver(self, param_vals, xmax, max_iter, n_elem):
-        res = {}
-        for m in param_vals:
-            nodes, c, history = spec_poly.solve_polytropic_spectral(m, N=n_elem, R=xmax, max_iter=max_iter)
-            ref_hi = spec_poly.get_true_reference(m, nodes)
-            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': ref_hi}
-        self._plot_standard_results("Chebyshev", spec_poly, param_vals, res)
-
-    def run_rk4_solver(self, param_vals, xmax, max_iter, n_elem):
-        res = {}
-        for m in param_vals:
-            nodes, c, history, step_history, d_sol, nit = rk4_poly.solve_polytropic_rk4(m, n_nodes=n_elem, R=xmax, max_iter=max_iter)
-            ref_hi = rk4_poly.get_true_reference(m, nodes)
-            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': ref_hi}
-        self._plot_standard_results("Shooting", rk4_poly, param_vals, res)
-
-    def run_adm_solver(self, param_vals, xmax, max_iter, n_elem, series_terms):
-        res = {}
-        for m in param_vals:
-            _, nodes, c, history, o_hist, pade, nit = adm_poly.solve_polytropic_adm(m, n_nodes=n_elem, R=xmax, max_iter=max_iter, N_series=series_terms)
-            ref_hi = adm_poly.get_true_reference(m, nodes)
-            res[m] = {'nodes': nodes, 'Y': c, 'history_nodes': history, 'ref_hi': ref_hi}
-        self._plot_standard_results("ADM", adm_poly, param_vals, res)
-
-    def run_bspline_solver(self, param_vals, xmax, max_iter, n_elem):
-        res = {}
-        _, _, tau_m, M0_m, _, _ = bsp_poly.build_bspline_operator(3, n_elem, xmax)
-        for m in param_vals:
-            t, tau, Y_final, history, c_spline, it = bsp_poly.solve_polytropic_bspline(m, p=3, n_elem=n_elem, R=xmax, max_iter=max_iter)
-            ref_hi = bsp_poly.get_true_reference(m, tau)
-            history_nodes = [M0_m @ h for h in history]
-            res[m] = {'nodes': tau, 'Y': Y_final, 'history_nodes': history_nodes, 'ref_hi': ref_hi}
-        self._plot_standard_results("B-Spline", bsp_poly, param_vals, res)
-
-    # -------------------------------------------------------------------------
-    # On-The-Fly Matplotlib Rendering 
+    # On-The-Fly Dynamic Matplotlib Rendering 
     # -------------------------------------------------------------------------
     def render_figure_at_index(self, index):
         if 0 <= index < len(self.plot_queue):
             data = self.plot_queue[index]
             
             self.canvas.fig.clf()
+            
+            # Dynamic Matplotlib Theme Integration
+            bg_color = '#121212' if self.is_dark_mode else '#FFFFFF'
+            fg_color = '#E0E0E0' if self.is_dark_mode else '#212529'
+            grid_color = '#333333' if self.is_dark_mode else '#DEE2E6'
+
+            self.canvas.fig.patch.set_facecolor(bg_color)
+            
             ax = self.canvas.fig.add_subplot(111, projection='3d')
+            ax.set_facecolor(bg_color)
+            
+            # Remove pane background fills for a cleaner look
+            ax.xaxis.set_pane_color((0.0, 0.0, 0.0, 0.0))
+            ax.yaxis.set_pane_color((0.0, 0.0, 0.0, 0.0))
+            ax.zaxis.set_pane_color((0.0, 0.0, 0.0, 0.0))
+            
+            # Apply dynamic text and tick colors
+            ax.xaxis.label.set_color(fg_color)
+            ax.yaxis.label.set_color(fg_color)
+            ax.zaxis.label.set_color(fg_color)
+            ax.tick_params(axis='x', colors=fg_color)
+            ax.tick_params(axis='y', colors=fg_color)
+            ax.tick_params(axis='z', colors=fg_color)
+            
+            # Apply dynamic grid colors
+            ax.xaxis._axinfo["grid"].update({"color": grid_color})
+            ax.yaxis._axinfo["grid"].update({"color": grid_color})
+            ax.zaxis._axinfo["grid"].update({"color": grid_color})
             
             surf = ax.plot_surface(data['X'], data['Y'], data['Z'], cmap=data['cmap'], edgecolor='k', alpha=0.9)
             
             ax.set_xlabel(data['xlabel'])
             ax.set_ylabel(data['ylabel'])
             ax.set_zlabel(data['zlabel'])
-            ax.set_title(data['title'], pad=10)
+            ax.set_title(data['title'], pad=10, color=fg_color, fontweight='bold')
             
             if data['int_y']:
                 ax.yaxis.set_major_locator(MaxNLocator(integer=True))
                 
-            self.canvas.fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.1)
+            cbar = self.canvas.fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.1)
+            cbar.ax.yaxis.set_tick_params(color=fg_color, labelcolor=fg_color)
+            cbar.outline.set_edgecolor(fg_color)
+            
             self.canvas.draw()
             
             self.gallery_stack.setCurrentWidget(self.canvas)
@@ -526,7 +857,8 @@ class LaneEmdenGUI(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Directory")
         if folder:
             for idx, data in enumerate(self.plot_queue):
-                fig = plt.figure(figsize=(9, 7))
+                fig = Figure(figsize=(9, 7))
+                AggCanvas(fig)
                 ax = fig.add_subplot(111, projection='3d')
                 surf = ax.plot_surface(data['X'], data['Y'], data['Z'], cmap=data['cmap'], edgecolor='k', alpha=0.9)
                 ax.set_xlabel(data['xlabel']); ax.set_ylabel(data['ylabel']); ax.set_zlabel(data['zlabel'])
@@ -537,7 +869,6 @@ class LaneEmdenGUI(QMainWindow):
                 clean_title = data['title'].replace(" ", "_").replace("-", "_").replace(":", "")
                 dest = os.path.join(folder, f"{idx+1:02d}_{clean_title}.png")
                 fig.savefig(dest, bbox_inches='tight')
-                plt.close(fig)
             QMessageBox.information(self, "Success", f"Exported {len(self.plot_queue)} images to {folder}")
 
     def export_to_word(self):
@@ -554,7 +885,8 @@ class LaneEmdenGUI(QMainWindow):
             for idx, data in enumerate(self.plot_queue):
                 doc.add_heading(f"Figure {idx+1}: {data['title']}", level=2)
                 
-                fig = plt.figure(figsize=(8, 6))
+                fig = Figure(figsize=(8, 6))
+                AggCanvas(fig)
                 ax = fig.add_subplot(111, projection='3d')
                 surf = ax.plot_surface(data['X'], data['Y'], data['Z'], cmap=data['cmap'], edgecolor='k', alpha=0.9)
                 ax.set_xlabel(data['xlabel']); ax.set_ylabel(data['ylabel']); ax.set_zlabel(data['zlabel'])
@@ -564,7 +896,6 @@ class LaneEmdenGUI(QMainWindow):
                 
                 img_stream = io.BytesIO()
                 fig.savefig(img_stream, format='png', bbox_inches='tight')
-                plt.close(fig)
                 img_stream.seek(0)
                 
                 doc.add_picture(img_stream, width=Inches(6.0))
